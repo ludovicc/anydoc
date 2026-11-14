@@ -13,8 +13,12 @@
 //! Known divergences, documented rather than asserted away:
 //! - `newspaper-00`: pdf-inspector rejects the content stream; the Markdown
 //!   path fails identically.
-//! - `right_to_left_*`: characters match but anydoc keeps PDF visual order
-//!   where Docling emits bidi-reordered logical text.
+//! - `table_misidentified_as_form`: the page is a scan whose text lives in
+//!   an invisible (Tr 3) OCR layer. pdf-inspector ≥1.25 suppresses invisible
+//!   text in positioned extraction, so the export is a `<picture>` page —
+//!   consistent with the Markdown path's `NeedsOcr`.
+//! - `right_to_left_*`: pdf-inspector ≥1.25 normalizes bidi text; anydoc
+//!   emits the extractor's order, which the reference may reorder.
 //! - Structure: Docling's layout model detects borderless tables, headings,
 //!   captions, and page furniture beyond anydoc's tagged/ruled-table and
 //!   font heuristics; counts therefore differ by design.
@@ -139,6 +143,13 @@ fn docling_groundtruth_text_coverage() {
         let dclx = result.unwrap_or_else(|e| panic!("{name}: export failed: {e}"));
         let xml = document_xml(&dclx);
         assert_well_formed(&xml);
+
+        // pdf-inspector ≥1.25 drops invisible (Tr 3) OCR layers from
+        // positioned extraction; this page's only text is such a layer,
+        // so a picture-only export is the correct outcome, not a gap.
+        if name == "table_misidentified_as_form" {
+            continue;
+        }
 
         let reference = text_chars(&std::fs::read_to_string(&reference_path).unwrap());
         let cov = coverage(&reference, &text_chars(&xml));
