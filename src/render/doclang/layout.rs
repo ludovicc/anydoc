@@ -173,52 +173,164 @@ pub(crate) fn link_rects(items: &[TextItem]) -> Vec<(BBox, String)> {
         .collect()
 }
 
-/// Lay out one page's items into pieces in reading order. `tagged` tells
-/// whether the document carries a structure tree at all; untagged pages get
-/// the font-size heading heuristic. `hints` gate list detection; `tables`
-/// carries this page's tagged tables and drawn rules for table detection.
-pub(crate) fn layout(
+#[derive(Debug, Clone, Copy)]
+struct VerticalSep {
+    x: f32,
+    y0: f32,
+    y1: f32,
+}
+
+fn detect_vertical_rules(
+    rules: &[crate::render::doclang::tables::Rule],
+    textish: &[TextItem],
+    initial_pieces: &[Piece],
+) -> Vec<VerticalSep> {
+    let mut v_seps: Vec<VerticalSep> = Vec::new();
+    for r in rules {
+        if !r.vertical {
+            continue;
+        }
+        let len = r.hi - r.lo;
+        if len < 30.0 {
+            continue;
+        }
+        let inside_table = initial_pieces.iter().any(|p| {
+            if let Piece::Table(t) = p {
+                t.bbox.contains(r.pos, (r.lo + r.hi) / 2.0)
+            } else {
+                false
+            }
+        });
+        if inside_table {
+            continue;
+        }
+        let y_lo = r.lo - 15.0;
+        let y_hi = r.hi + 15.0;
+        let has_left = textish.iter().any(|it| {
+            let mid_y = it.y + it.height * 0.5;
+            mid_y >= y_lo
+                && mid_y <= y_hi
+                && (it.x + it.width) <= r.pos + 5.0
+                && it.x >= r.pos - 400.0
+        });
+        let has_right = textish.iter().any(|it| {
+            let mid_y = it.y + it.height * 0.5;
+            mid_y >= y_lo
+                && mid_y <= y_hi
+                && it.x >= r.pos - 5.0
+                && (it.x + it.width) <= r.pos + 400.0
+        });
+        if !has_left || !has_right {
+            continue;
+        }
+        let crossing_count = textish
+            .iter()
+            .filter(|it| {
+                let mid_y = it.y + it.height * 0.5;
+                mid_y >= r.lo
+                    && mid_y <= r.hi
+                    && it.x < r.pos - 5.0
+                    && (it.x + it.width) > r.pos + 5.0
+            })
+            .count();
+        if crossing_count <= 1 {
+            v_seps.push(VerticalSep { x: r.pos, y0: r.lo, y1: r.hi });
+        }
+    }
+    v_seps
+}
+
+fn detect_whitespace_gutters(textish: &[TextItem]) -> Vec<VerticalSep> {
+    if textish.len() < 4 {
+        return Vec::new();
+    }
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    for it in textish {
+        min_x = min_x.min(it.x);
+        max_x = max_x.max(it.x + it.width);
+    }
+    let total_w = max_x - min_x;
+    if total_w < 100.0 {
+        return Vec::new();
+    }
+
+    let mut best_sep: Option<VerticalSep> = None;
+    let mut best_score = 0.0f32;
+
+    let mut candidate_x = min_x + 0.25 * total_w;
+    while candidate_x <= min_x + 0.75 * total_w {
+        let mut left_items: Vec<&TextItem> = Vec::new();
+        let mut right_items: Vec<&TextItem> = Vec::new();
+
+        let mut max_left_x = f32::MIN;
+        let mut min_right_x = f32::MAX;
+
+        for it in textish {
+            let x0 = it.x;
+            let x1 = it.x + it.width;
+            if x1 <= candidate_x {
+                max_left_x = max_left_x.max(x1);
+                left_items.push(it);
+            } else if x0 >= candidate_x {
+                min_right_x = min_right_x.min(x0);
+                right_items.push(it);
+            }
+        }
+
+        if left_items.len() >= 2 && right_items.len() >= 2 && min_right_x > max_left_x {
+            let gap_w = min_right_x - max_left_x;
+            if gap_w >= 12.0 {
+                let left_y_min = left_items.iter().map(|it| it.y).fold(f32::MAX, f32::min);
+                let left_y_max =
+                    left_items.iter().map(|it| it.y + it.height).fold(f32::MIN, f32::max);
+                let right_y_min = right_items.iter().map(|it| it.y).fold(f32::MAX, f32::min);
+                let right_y_max =
+                    right_items.iter().map(|it| it.y + it.height).fold(f32::MIN, f32::max);
+
+                let overlap_y0 = left_y_min.max(right_y_min);
+                let overlap_y1 = left_y_max.min(right_y_max);
+
+                if overlap_y1 - overlap_y0 >= 25.0 {
+                    let crossing = textish.iter().any(|it| {
+                        let y0 = it.y;
+                        let y1 = it.y + it.height;
+                        let y_overlap = y0 < overlap_y1 && y1 > overlap_y0;
+                        y_overlap && it.x < min_right_x && (it.x + it.width) > max_left_x
+                    });
+                    if !crossing {
+                        let split_x = (max_left_x + min_right_x) * 0.5;
+                        let score = (overlap_y1 - overlap_y0) * gap_w.min(50.0);
+                        if score > best_score {
+                            best_score = score;
+                            best_sep =
+                                Some(VerticalSep { x: split_x, y0: overlap_y0, y1: overlap_y1 });
+                        }
+                    }
+                }
+            }
+        }
+        candidate_x += 5.0;
+    }
+
+    best_sep.into_iter().collect()
+}
+
+fn layout_text_stream(
     items: Vec<TextItem>,
     roles: &Roles,
     tagged: bool,
     hints: &crate::DoclangHints,
-    tables: &super::tables::TableCtx,
+    median: f32,
 ) -> Vec<Piece> {
-    let median = median_font(&items);
-    let mut textish: Vec<TextItem> = Vec::new();
-    let mut pieces: Vec<Piece> = Vec::new();
-    for item in items {
-        match &item.item_type {
-            ItemType::Image => {
-                let name = item
-                    .text
-                    .strip_prefix("[Image: ")
-                    .and_then(|s| s.strip_suffix(']'))
-                    .unwrap_or("")
-                    .to_string();
-                pieces.push(Piece::Picture { item, name, full_page: false });
-            }
-            ItemType::FormField => pieces.push(Piece::Field(item)),
-            // Link items describe an annotation rectangle over existing
-            // text; the markup stage uses them to attach hrefs.
-            ItemType::Link(_) => {}
-            ItemType::Text => textish.push(item),
-        }
+    if items.is_empty() {
+        return Vec::new();
     }
-    // Tables claim their items before line grouping: tagged tables match
-    // by marked-content id, ruled tables by position inside a drawn grid.
-    if hints.tables {
-        for block in super::tables::detect(&mut textish, tables) {
-            pieces.push(Piece::Table(block));
-        }
-    }
-    // Lines run top-down; a marker line starts or extends a list run, an
-    // indented unmarked line continues the current item, and anything else
-    // closes the run and merges into paragraphs.
+    let mut pieces = Vec::new();
     let mut run: Vec<(Line, Option<Marker>)> = Vec::new();
     let mut run_prev: Option<BBox> = None;
     let mut run_indent = 0.0f32;
-    for line in lines(textish) {
+    for line in lines(items) {
         let probe = if hints.lists { probe_marker(&line) } else { None };
         match probe {
             Some(marker) => {
@@ -250,13 +362,181 @@ pub(crate) fn layout(
         }
     }
     flush_run(&mut run, &mut pieces, roles, tagged, median);
-    pieces.sort_by(|a, b| {
+    pieces
+}
+
+/// Lay out one page's items into pieces in reading order. `tagged` tells
+/// whether the document carries a structure tree at all; untagged pages get
+/// the font-size heading heuristic. `hints` gate list detection; `tables`
+/// carries this page's tagged tables and drawn rules for table detection.
+pub(crate) fn layout(
+    items: Vec<TextItem>,
+    roles: &Roles,
+    tagged: bool,
+    hints: &crate::DoclangHints,
+    tables: &super::tables::TableCtx,
+) -> Vec<Piece> {
+    let median = median_font(&items);
+    let mut textish: Vec<TextItem> = Vec::new();
+    let mut initial_pieces: Vec<Piece> = Vec::new();
+    for item in items {
+        match &item.item_type {
+            ItemType::Image => {
+                let name = item
+                    .text
+                    .strip_prefix("[Image: ")
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or("")
+                    .to_string();
+                initial_pieces.push(Piece::Picture { item, name, full_page: false });
+            }
+            ItemType::FormField => initial_pieces.push(Piece::Field(item)),
+            ItemType::Link(_) => {}
+            ItemType::Text => textish.push(item),
+        }
+    }
+    if hints.tables {
+        for block in super::tables::detect(&mut textish, tables) {
+            initial_pieces.push(Piece::Table(block));
+        }
+    }
+
+    let v_seps = {
+        let rules_seps = detect_vertical_rules(tables.rules, &textish, &initial_pieces);
+        if !rules_seps.is_empty() { rules_seps } else { detect_whitespace_gutters(&textish) }
+    };
+
+    if v_seps.is_empty() {
+        let mut pieces = initial_pieces;
+        let mut text_pieces = layout_text_stream(textish, roles, tagged, hints, median);
+        pieces.append(&mut text_pieces);
+        pieces.sort_by(|a, b| {
+            let (a, b) = (a.bbox(), b.bbox());
+            b.y1.partial_cmp(&a.y1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        return pieces;
+    }
+
+    let sep = v_seps[0];
+    let sep_y0 = sep.y0;
+    let sep_y1 = sep.y1;
+
+    let mut top_items: Vec<TextItem> = Vec::new();
+    let mut bottom_items: Vec<TextItem> = Vec::new();
+    let mut left_items: Vec<TextItem> = Vec::new();
+    let mut right_items: Vec<TextItem> = Vec::new();
+
+    for it in textish {
+        let mid_y = it.y + it.height * 0.5;
+        if mid_y > sep_y1 + 2.0 {
+            top_items.push(it);
+        } else if mid_y < sep_y0 - 2.0 {
+            bottom_items.push(it);
+        } else if (it.x + it.width) <= sep.x + 5.0 {
+            left_items.push(it);
+        } else if it.x >= sep.x - 5.0 {
+            right_items.push(it);
+        } else if mid_y > (sep_y0 + sep_y1) * 0.5 {
+            top_items.push(it);
+        } else {
+            bottom_items.push(it);
+        }
+    }
+
+    let mut top_pieces: Vec<Piece> = Vec::new();
+    let mut bottom_pieces: Vec<Piece> = Vec::new();
+    let mut left_pieces: Vec<Piece> = Vec::new();
+    let mut right_pieces: Vec<Piece> = Vec::new();
+
+    for p in initial_pieces {
+        let b = p.bbox();
+        let mid_y = (b.y0 + b.y1) * 0.5;
+        if mid_y > sep_y1 + 2.0 {
+            top_pieces.push(p);
+        } else if mid_y < sep_y0 - 2.0 {
+            bottom_pieces.push(p);
+        } else if b.x1 <= sep.x + 5.0 {
+            left_pieces.push(p);
+        } else if b.x0 >= sep.x - 5.0 {
+            right_pieces.push(p);
+        } else if mid_y > (sep_y0 + sep_y1) * 0.5 {
+            top_pieces.push(p);
+        } else {
+            bottom_pieces.push(p);
+        }
+    }
+
+    let mut top_out = layout_text_stream(top_items, roles, tagged, hints, median);
+    top_out.append(&mut top_pieces);
+    top_out.sort_by(|a, b| {
         let (a, b) = (a.bbox(), b.bbox());
         b.y1.partial_cmp(&a.y1)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
     });
-    pieces
+
+    let mut left_out = layout_text_stream(left_items, roles, tagged, hints, median);
+    left_out.append(&mut left_pieces);
+    left_out.sort_by(|a, b| {
+        let (a, b) = (a.bbox(), b.bbox());
+        b.y1.partial_cmp(&a.y1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut right_out = layout_text_stream(right_items, roles, tagged, hints, median);
+    right_out.append(&mut right_pieces);
+    right_out.sort_by(|a, b| {
+        let (a, b) = (a.bbox(), b.bbox());
+        b.y1.partial_cmp(&a.y1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut bottom_out = layout_text_stream(bottom_items, roles, tagged, hints, median);
+    bottom_out.append(&mut bottom_pieces);
+    bottom_out.sort_by(|a, b| {
+        let (a, b) = (a.bbox(), b.bbox());
+        b.y1.partial_cmp(&a.y1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let is_rtl = {
+        let mut rtl = 0;
+        let mut ltr = 0;
+        for p in left_out.iter().chain(right_out.iter()) {
+            if let Piece::Text(b) = p {
+                for it in &b.items {
+                    for ch in it.text.chars() {
+                        if ('\u{0600}'..='\u{06FF}').contains(&ch)
+                            || ('\u{0590}'..='\u{05FF}').contains(&ch)
+                        {
+                            rtl += 1;
+                        } else if ch.is_alphabetic() {
+                            ltr += 1;
+                        }
+                    }
+                }
+            }
+        }
+        rtl > ltr
+    };
+
+    let mut final_pieces = Vec::new();
+    final_pieces.extend(top_out);
+    if is_rtl {
+        final_pieces.extend(right_out);
+        final_pieces.extend(left_out);
+    } else {
+        final_pieces.extend(left_out);
+        final_pieces.extend(right_out);
+    }
+    final_pieces.extend(bottom_out);
+
+    final_pieces
 }
 
 /// Group items into lines by baseline proximity, each line sorted
@@ -829,6 +1109,104 @@ mod tests {
         let nested = &list.items[0].nested;
         assert_eq!(nested.len(), 1);
         assert_eq!(nested[0].items.len(), 2);
+    }
+
+    #[test]
+    fn two_columns_with_vertical_rule_preserve_reading_order() {
+        let items = vec![
+            item("Main Title", 50.0, 750.0),
+            item("Left line 1", 50.0, 700.0),
+            item("Left line 2", 50.0, 680.0),
+            item("Right line 1", 300.0, 700.0),
+            item("Right line 2", 300.0, 680.0),
+        ];
+        let vrule = crate::render::doclang::tables::Rule {
+            vertical: true,
+            pos: 200.0,
+            lo: 650.0,
+            hi: 720.0,
+        };
+        let rules = vec![vrule];
+        let tables = crate::render::doclang::tables::TableCtx {
+            tagged: &[],
+            rules: &rules,
+            ruled: true,
+            page: 1,
+        };
+        let pieces = layout(items, &Roles::new(), false, &crate::DoclangHints::default(), &tables);
+
+        let texts: Vec<String> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Text(b) => {
+                    Some(b.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join(" "))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Must read Title -> Left column -> Right column
+        assert_eq!(texts.len(), 3, "expected 3 distinct blocks, got {texts:?}");
+        assert!(texts[0].contains("Main Title"), "first must be title, got {:?}", texts[0]);
+        assert!(
+            texts[1].contains("Left line 1") && texts[1].contains("Left line 2"),
+            "second must be left column, got {:?}",
+            texts[1]
+        );
+        assert!(
+            !texts[1].contains("Right"),
+            "left column must not contain right column text, got {:?}",
+            texts[1]
+        );
+        assert!(
+            texts[2].contains("Right line 1") && texts[2].contains("Right line 2"),
+            "third must be right column, got {:?}",
+            texts[2]
+        );
+        assert!(
+            !texts[2].contains("Left"),
+            "right column must not contain left column text, got {:?}",
+            texts[2]
+        );
+    }
+
+    #[test]
+    fn two_columns_with_gutter_preserve_reading_order() {
+        let items = vec![
+            item("Header across top", 50.0, 750.0),
+            item("Col A line 1", 50.0, 700.0),
+            item("Col A line 2", 50.0, 680.0),
+            item("Col B line 1", 320.0, 700.0),
+            item("Col B line 2", 320.0, 680.0),
+        ];
+        let rules = Vec::new();
+        let tables = crate::render::doclang::tables::TableCtx {
+            tagged: &[],
+            rules: &rules,
+            ruled: false,
+            page: 1,
+        };
+        let pieces = layout(items, &Roles::new(), false, &crate::DoclangHints::default(), &tables);
+
+        let texts: Vec<String> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Text(b) => {
+                    Some(b.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join(" "))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(texts.len(), 3, "expected 3 distinct blocks, got {texts:?}");
+        assert!(texts[0].contains("Header"), "first must be header, got {:?}", texts[0]);
+        assert!(texts[1].contains("Col A line 1"), "second must be column A, got {:?}", texts[1]);
+        assert!(
+            !texts[1].contains("Col B"),
+            "column A must not contain column B text, got {:?}",
+            texts[1]
+        );
+        assert!(texts[2].contains("Col B line 1"), "third must be column B, got {:?}", texts[2]);
     }
 
     #[test]
