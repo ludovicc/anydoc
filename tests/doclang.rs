@@ -48,6 +48,29 @@ fn assert_opc(parts: &std::collections::HashMap<String, Vec<u8>>) {
 }
 
 #[test]
+fn two_column_pdf_reads_columns_in_order() {
+    let bytes = two_column_pdf();
+    let dclx = anydoc::to_doclang_bytes(&bytes, anydoc::Format::Pdf, None).unwrap();
+    let xml = document_xml(&unzip(&dclx));
+    assert_well_formed(&xml);
+
+    let header = xml.find("Header").unwrap();
+    let left = xml.find("Left column").unwrap();
+    let right = xml.find("Right column").unwrap();
+    let footer = xml.find("Footer").unwrap();
+    assert!(
+        header < left && left < right && right < footer,
+        "bad order: header={header} left={left} right={right} footer={footer}"
+    );
+
+    let block_start = xml[..left].rfind("<text").unwrap();
+    let block_end = left + xml[left..].find("</text>").unwrap() + "</text>".len();
+    let block = &xml[block_start..block_end];
+    assert!(block.contains("Left column"), "left block missing text: {block}");
+    assert!(!block.contains("Right column"), "columns merged into one block: {block}");
+}
+
+#[test]
 fn scanned_pdf_exports_pages_as_pictures() {
     let bytes = std::fs::read(fixture_root().join("pdf/handmade-scanned.pdf")).unwrap();
     // The Markdown path refuses this fixture with NeedsOcr; DocLang must not.
@@ -220,6 +243,78 @@ fn ruled_table_pdf() -> Vec<u8> {
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
             "Contents" => contents_id,
             "Resources" => dictionary! { "Font" => dictionary! { "F1" => regular, "F2" => bold } },
+        }),
+    );
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(
+            dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 },
+        ),
+    );
+    doc.trailer.set("Root", catalog_id);
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).unwrap();
+    buf
+}
+
+/// A one-page PDF with a vertical divider and two text columns, built with
+/// lopdf. The divider is a stroked path, not a table grid.
+fn two_column_pdf() -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{Document, Object, Stream, dictionary};
+
+    fn text(ops: &mut Vec<Operation>, x: i64, y: i64, s: &str) {
+        ops.extend([
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec!["F1".into(), 10.into()]),
+            Operation::new("Tm", vec![1.into(), 0.into(), 0.into(), 1.into(), x.into(), y.into()]),
+            Operation::new("Tj", vec![Object::string_literal(s)]),
+            Operation::new("ET", vec![]),
+        ]);
+    }
+
+    let mut ops = Vec::new();
+    text(&mut ops, 60, 760, "Header");
+    for y in [630, 610, 590, 570] {
+        text(&mut ops, 60, y, "Left column");
+        text(&mut ops, 330, y, "Right column");
+    }
+    text(&mut ops, 60, 450, "Footer");
+    ops.extend([
+        Operation::new("m", vec![300.into(), 500.into()]),
+        Operation::new("l", vec![300.into(), 650.into()]),
+        Operation::new("S", vec![]),
+    ]);
+    let content = Content { operations: ops };
+
+    let mut doc = Document::with_version("1.5");
+    let catalog_id = doc.new_object_id();
+    let pages_id = doc.new_object_id();
+    let regular = doc.new_object_id();
+    let contents_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    doc.objects.insert(
+        catalog_id,
+        Object::Dictionary(dictionary! { "Type" => "Catalog", "Pages" => pages_id }),
+    );
+    doc.objects.insert(
+        regular,
+        Object::Dictionary(
+            dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" },
+        ),
+    );
+    doc.objects.insert(
+        contents_id,
+        Object::Stream(Stream::new(dictionary! {}, content.encode().unwrap())),
+    );
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Contents" => contents_id,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => regular } },
         }),
     );
     doc.objects.insert(
